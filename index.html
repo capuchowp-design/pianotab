@@ -2115,7 +2115,19 @@ themeBtn.addEventListener('click',()=>{
 // ======================== SERVICE WORKER ========================
 if('serviceWorker' in navigator){
     window.addEventListener('load',()=>{
-        navigator.serviceWorker.register('./sw.js').catch(()=>{});
+        // updateViaCache:'none' → o navegador sempre confere se o sw.js mudou
+        navigator.serviceWorker.register('./sw.js',{updateViaCache:'none'}).then(reg=>{
+            reg.update().catch(()=>{});
+            document.addEventListener('visibilitychange',()=>{ if(!document.hidden) reg.update().catch(()=>{}); });
+        }).catch(()=>{});
+        // Quando uma versão nova assume o controle, recarrega uma vez para mostrar a versão atualizada
+        let reloaded=false, hadController=!!navigator.serviceWorker.controller;
+        navigator.serviceWorker.addEventListener('controllerchange',()=>{
+            if(!hadController){ hadController=true; return; } // primeira instalação: não recarrega
+            if(reloaded) return; reloaded=true;
+            if(!dragState && !scoreNotes.length) location.reload();
+            else toast('Nova versão disponível — recarregue a página','success');
+        });
     });
 }
 
