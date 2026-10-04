@@ -1,5 +1,5 @@
 // Mude este número a CADA publicação nova no GitHub (v3 -> v4 -> v5...)
-const CACHE_NAME = 'note-bounce-v3';
+const CACHE_NAME = 'note-bounce-v4';
 const CORE = ['./', './index.html', './manifest.json'];
 const EXTRA = [
   './icon-192x192.png', './icon-512x512.png', './apple-touch-icon.png', './favicon-32x32.png',
@@ -35,7 +35,18 @@ self.addEventListener('fetch', event => {
   if (req.method !== 'GET') return;
   const url = new URL(req.url);
 
-  // Soundfonts: rede primeiro
+  // Amostras do piano (Salamander): cache primeiro. Baixa uma vez e depois toca rápido e até offline.
+  if (url.hostname === 'tonejs.github.io' || (url.hostname === 'cdn.jsdelivr.net' && url.pathname.includes('/Tonejs/audio'))) {
+    event.respondWith(
+      caches.match(req).then(cached => cached || fetch(req).then(res => {
+        if (res && (res.status === 200 || res.type === 'opaque')) { const c = res.clone(); caches.open(CACHE_NAME).then(ca => ca.put(req, c)); }
+        return res;
+      }))
+    );
+    return;
+  }
+
+  // Soundfonts antigos: rede primeiro
   if (url.hostname === 'gleitz.github.io') {
     event.respondWith(
       fetch(req).then(res => { const c = res.clone(); caches.open(CACHE_NAME).then(ca => ca.put(req, c)); return res; })

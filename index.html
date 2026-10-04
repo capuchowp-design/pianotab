@@ -676,7 +676,7 @@ const state={
     pianoKeys:[], lowestNote:21, highestNote:108,
     totalNotes:0, animFrameId:null,
     pausedAt:0,
-    sampler:null, samplerReady:false,
+    sampler:null, samplerReady:false, piano:null, synth:null,
     midiLoaded:false,
     pps:200  // pixels per second
 };
@@ -717,43 +717,96 @@ function lighter(hex,a){let r=parseInt(hex.slice(1,3),16),g=parseInt(hex.slice(3
 function toast(msg,type='error'){const t=type==='error'?errorToast:successToast;t.textContent=msg;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),3000);}
 
 // ======================== PIANO SAMPLER (Realistic) ========================
+// Piano de cauda real (Salamander Grand Piano, gravado nota a nota) + leve reverb de sala.
+// Se o piano demorar a carregar (internet lenta), o app toca com o sintetizador e TROCA
+// automaticamente para o piano real assim que terminar de baixar. O MIDI exportado não muda.
+const PIANO_SOURCES=[
+    'https://tonejs.github.io/audio/salamander/',
+    'https://cdn.jsdelivr.net/gh/Tonejs/audio@master/salamander/'   // espelho, caso o primeiro falhe
+];
+function pianoUrls(){
+    const u={A0:'A0.mp3',C8:'C8.mp3'};
+    for(let o=1;o<=7;o++){ u['C'+o]='C'+o+'.mp3'; u['D#'+o]='Ds'+o+'.mp3'; u['F#'+o]='Fs'+o+'.mp3'; u['A'+o]='A'+o+'.mp3'; }
+    return u;
+}
+function setSynthBadge(mode){
+    const el=document.getElementById('synthBadge'); if(!el) return;
+    if(mode==='piano')   el.innerHTML='<span class="dot"></span>Piano Real';
+    else if(mode==='loading') el.innerHTML='<span class="dot" style="background:#00d2ff"></span>Carregando piano…';
+    else el.innerHTML='<span class="dot" style="background:#ffa500"></span>Sintetizador';
+}
+function applyVolume(){
+    const db=Tone.gainToDb(Math.max(0.0001,state.volume));
+    [state.piano,state.synth].forEach(n=>{ try{ if(n) n.volume.value=db; }catch(e){} });
+}
+// cadeia de saída compartilhada: instrumento → reverb leve → limitador → alto-falante
+let outChain=null;
+async function getOutChain(){
+    if(outChain) return outChain;
+    let head=Tone.getDestination();
+    try{
+        const limiter=new Tone.Limiter(-1).connect(head); head=limiter;
+        const reverb=new Tone.Reverb({decay:2.2,preDelay:0.012,wet:0.16}).connect(head);
+        await reverb.generate();
+        head=reverb;
+    }catch(e){}
+    outChain=head; return head;
+}
+function loadPianoFrom(base,out){
+    return new Promise((resolve,reject)=>{
+        let done=false;
+        const t=setTimeout(()=>{ if(!done){ done=true; reject(new Error('timeout')); } },45000);
+        let smp;
+        try{
+            smp=new Tone.Sampler({
+                urls:pianoUrls(), baseUrl:base, release:1.2,
+                onload:()=>{ if(done){ try{smp.dispose();}catch(e){} return; } done=true; clearTimeout(t); resolve(smp); },
+                onerror:err=>{ if(!done){ done=true; clearTimeout(t); try{smp.dispose();}catch(e){} reject(err||new Error('erro')); } }
+            }).connect(out);
+        }catch(e){ if(!done){ done=true; clearTimeout(t); reject(e); } }
+    });
+}
+function useSynth(out){
+    if(state.synth) return;
+    state.synth=new Tone.PolySynth(Tone.Synth,{
+        oscillator:{type:'triangle'},
+        envelope:{attack:0.005,decay:0.3,sustain:0.15,release:1.2}
+    }).connect(out);
+    if(!state.piano){ state.sampler=state.synth; state.samplerReady=true; setSynthBadge('synth'); }
+    applyVolume();
+}
 let samplerPromise=null;
 function initSampler(){
     if(samplerPromise) return samplerPromise;
+    setSynthBadge('loading');
     samplerPromise=new Promise(async resolve=>{
-        try {
-            const base='https://gleitz.github.io/midi.js-soundfonts/MusyngKite/acoustic_grand_piano-mp3/';
-            const keys=['A0','C1','Ds1','Fs1','A1','C2','Ds2','Fs2','A2','C3','Ds3','Fs3','A3','C4','Ds4','Fs4','A4','C5','Ds5','Fs5','A5','C6','Ds6','Fs6','A6','C7','Ds7','Fs7','A7','C8'];
-            const urls={};
-            keys.forEach(k=>{ urls[k]=base+k+'.mp3'; });
-
-            state.sampler=new Tone.Sampler({
-                urls, release:1.5,
-                onload:()=>{
-                    state.samplerReady=true;
-                    state.sampler.volume.value=Tone.gainToDb(state.volume);
-                    document.getElementById('synthBadge').innerHTML='<span class="dot"></span>Piano Real';
-                    resolve(true);
-                },
-                onerror:()=>{ fallback(); resolve(false); }
-            }).toDestination();
-
-            setTimeout(()=>{ if(!state.samplerReady){ fallback(); resolve(false); } }, 10000);
-        } catch(e){ fallback(); resolve(false); }
+        let out; try{ out=await getOutChain(); }catch(e){ out=Tone.getDestination(); }
+        // 1) tenta carregar o piano real (em segundo plano)
+        const pianoJob=(async()=>{
+            for(const base of PIANO_SOURCES){
+                try{
+                    const piano=await loadPianoFrom(base,out);
+                    state.piano=piano; applyVolume();
+                    const old=state.synth;
+                    state.sampler=piano; state.samplerReady=true;
+                    if(old){ setTimeout(()=>{ try{old.releaseAll();old.dispose();}catch(e){} state.synth=null; },3000); }
+                    setSynthBadge('piano');
+                    return true;
+                }catch(e){}
+            }
+            return false;
+        })();
+        // 2) espera até 8 s; se não carregou, já libera o app com o sintetizador (e troca depois)
+        const ok=await Promise.race([pianoJob, new Promise(r=>setTimeout(()=>r(null),8000))]);
+        if(ok===null){ useSynth(out); setSynthBadge('loading'); }
+        if(ok===false){ useSynth(out); setSynthBadge('synth'); samplerPromise=null; } // permite tentar de novo depois
+        pianoJob.then(r=>{ if(r===false&&!state.piano){ useSynth(out); setSynthBadge('synth'); samplerPromise=null; } });
+        resolve(!!state.piano);
     });
     return samplerPromise;
 }
-
-function fallback(){
-    if(state.sampler){try{state.sampler.dispose();}catch(e){}}
-    state.sampler=new Tone.PolySynth(Tone.Synth,{
-        oscillator:{type:'triangle'},
-        envelope:{attack:0.005,decay:0.3,sustain:0.15,release:1.2}
-    }).toDestination();
-    state.sampler.volume.value=Tone.gainToDb(state.volume);
-    state.samplerReady=true;
-    document.getElementById('synthBadge').innerHTML='<span class="dot" style="background:#ffa500"></span>Sintetizador';
-}
+// voltou a ter internet e ainda estamos no sintetizador → tenta baixar o piano de novo
+window.addEventListener('online',()=>{ if(!state.piano){ samplerPromise=null; initSampler(); } });
 
 // ======================== CANVAS RESIZE ========================
 function resizeCanvases(){
@@ -836,7 +889,7 @@ async function startPlayback(){
         const dur=Math.max(0.05, note.duration/spd);
         Tone.Transport.schedule(time=>{
             if(!state.isPlaying||!state.sampler||!state.samplerReady) return;
-            try { state.sampler.triggerAttackRelease(nname(note.midi), dur, time, note.velocity*state.volume); } catch(e){}
+            try { state.sampler.triggerAttackRelease(nname(note.midi), dur, time, note.velocity); } catch(e){}
         }, tStart);
     });
 
@@ -1102,7 +1155,7 @@ speedSelect.addEventListener('change',e=>{
 
 volumeSlider.addEventListener('input',e=>{
     state.volume=parseInt(e.target.value)/100;
-    if(state.sampler){try{state.sampler.volume.value=Tone.gainToDb(state.volume);}catch(e){}}
+    try{ applyVolume(); }catch(e){}
 });
 
 document.addEventListener('keydown',e=>{
@@ -1247,7 +1300,7 @@ function rebuildChordRows(){
         sel.addEventListener('change',async e=>{
             chordVoiceNotes[v.id]=parseInt(e.target.value);
             await Tone.start(); if(!state.samplerReady) await initSampler();
-            try{ state.sampler.triggerAttackRelease(nname(parseInt(e.target.value)),'8n',Tone.now(),0.5*state.volume); }catch(er){}
+            try{ state.sampler.triggerAttackRelease(nname(parseInt(e.target.value)),'8n',Tone.now(),0.5); }catch(er){}
         });
         // remove toggle
         const rmBtn=document.createElement('button');
@@ -1328,7 +1381,7 @@ async function previewNote(midi){
     await Tone.start();
     if(!state.samplerReady) await initSampler();
     const m=Math.max(21,Math.min(108,midi+selAccidental));
-    try{ state.sampler.triggerAttackRelease(nname(m),'8n',Tone.now(),0.55*state.volume); }catch(e){}
+    try{ state.sampler.triggerAttackRelease(nname(m),'8n',Tone.now(),0.55); }catch(e){}
 }
 
 // ---- Duration & modifier buttons ----
@@ -1932,7 +1985,7 @@ function openEditPopup(noteIdx,px,py){
     // preview on midi change
     popup.querySelector('#ep-midi').addEventListener('change',async e=>{
         await Tone.start(); if(!state.samplerReady) await initSampler();
-        try{ state.sampler.triggerAttackRelease(nname(parseInt(e.target.value)),'8n',Tone.now(),0.55*state.volume); }catch(er){}
+        try{ state.sampler.triggerAttackRelease(nname(parseInt(e.target.value)),'8n',Tone.now(),0.55); }catch(er){}
     });
 }
 function closeEditPopup(){ if(editPopup){ editPopup.remove(); editPopup=null; } }
